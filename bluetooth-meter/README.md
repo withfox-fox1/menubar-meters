@@ -14,7 +14,7 @@
 - `IOBluetoothDevice` の非公開プロパティ `batteryPercentSingle/Left/Right/Case` を読む。将来の macOS で取れなくなった場合は残量が出ないだけで動作は継続する。
 - 同一プロセス内ではプロセス起動時の値から更新されず、切断→再接続後は 0 のままになる（2026-10-12 実測）。
   そのため取得のたびに自分自身を `--dump-battery` 付きで別プロセス起動して最新値を JSON で受け取る。
-- 動作確認済み：Shokz OpenRun Pro 2（single）。Sony WF-1000XM5（左右）は未確認。
+- 動作確認済み：Shokz OpenRun Pro 2（single）。Sony WF-1000XM5 は左右別ではなく single の1値のみ取得される（2026-10-13 時点、左右表示は見送り）。
 
 ## ビルド・インストール
 ```
