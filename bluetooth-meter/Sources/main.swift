@@ -155,6 +155,8 @@ enum BatteryReader {
 
 enum StatusImageRenderer {
     static let height: CGFloat = 22
+    /// メニューバー項目の左右余白の合計
+    static let horizontalPadding: CGFloat = 10
 
     /// 未接続時：Bluetooth ロゴのみ
     static func renderIdle() -> NSImage {
@@ -227,12 +229,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var connectNotification: IOBluetoothUserNotification?
     private var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
     private var levels: [String: BatteryLevels] = [:]
+    private var isMenuOpen = false
+    private var lastRepair = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.autosaveName = "BluetoothMeter"
         menu.delegate = self
-        statusItem.menu = menu
+        installStatusItem()
 
         registerLoginItemOnFirstLaunch()
 
@@ -281,11 +283,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func update() {
         guard let button = statusItem.button else { return }
         let devices = DeviceInfo.all(levels: levels)
-        if let primary = primaryDevice(devices) {
-            button.image = StatusImageRenderer.render(primary)
-        } else {
-            button.image = StatusImageRenderer.renderIdle()
-        }
+        let image = primaryDevice(devices).map(StatusImageRenderer.render) ?? StatusImageRenderer.renderIdle()
+        button.image = image
+        // variableLength のままだと、幅の広い画像から狭い画像へ差し替えても項目幅が縮まないことがある
+        // （2026-10-15 実測：イヤホン切断後もロゴの右に空白が残った）。画像幅に合わせて明示的に設定する
+        statusItem.length = image.size.width + StatusImageRenderer.horizontalPadding
+        // 反映はメニューバー側で非同期に行われるため、少し待ってから幅の詰まりを確認する
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.repairIfStuck() }
         let connected = devices.filter(\.isConnected)
         button.toolTip = connected.isEmpty
             ? "Bluetooth：接続中のデバイスなし"
@@ -293,7 +297,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .joined(separator: "\n")
     }
 
+    // MARK: メニューバー項目
+
+    private func installStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = "BluetoothMeter"  // 再作成しても並び位置が保たれる
+        statusItem.menu = menu
+    }
+
+    /// length を明示しても、長時間起動後などに項目ウィンドウの幅が追従しないことがある。
+    /// - 広いまま残る：ロゴの右に空白ができる（2026-10-15 実測、再起動で解消）
+    /// - 狭いまま残る：テキストが右隣の項目（Wi-Fi 等）に重なって描かれる（2026-10-16 実測）
+    /// 正常時のウィンドウ幅は length + 6pt 程度なので、そこから明らかに外れていれば項目を作り直す。
+    private func repairIfStuck() {
+        guard !isMenuOpen, let window = statusItem.button?.window else { return }
+        let excess = window.frame.width - statusItem.length
+        guard excess > 12 || excess < -2 else { return }
+        // 作り直しても直らない場合に繰り返さないよう、間隔を空ける
+        guard Date().timeIntervalSince(lastRepair) > 60 else { return }
+        lastRepair = Date()
+        NSLog("BluetoothMeter: status item stuck (window \(window.frame.width)pt, length \(statusItem.length)pt); recreating")
+        NSStatusBar.system.removeStatusItem(statusItem)
+        installStatusItem()
+        update()
+    }
+
     // MARK: メニュー
+
+    func menuWillOpen(_ menu: NSMenu) { isMenuOpen = true }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+        update()
+    }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
