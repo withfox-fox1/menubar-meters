@@ -44,7 +44,7 @@ xcode-select -p && xcrun --find swiftc
 ```bash
 cd ~
 if [ -d menubar-meters/.git ]; then git -C menubar-meters pull --ff-only; else git clone https://github.com/withfox-fox1/menubar-meters.git; fi
-cd ~/menubar-meters
+cd ~/claude/tools/menubar-meters
 ```
 
 ### 3. 導入前の状態確認（任意だが推奨）
@@ -88,7 +88,7 @@ pgrep -lx "ClockMeter|BatteryMeter|BluetoothMeter"
 ## 今後コードを更新したとき
 
 ```bash
-cd ~/menubar-meters && git pull --ff-only && ./install.sh
+cd ~/claude/tools/menubar-meters && git pull --ff-only && ./install.sh
 ```
 
 （設定のバックアップは初回の値を保持したまま上書きしない）
@@ -96,7 +96,7 @@ cd ~/menubar-meters && git pull --ff-only && ./install.sh
 ## アンインストール（元に戻す）
 
 ```bash
-cd ~/menubar-meters && ./uninstall.sh
+cd ~/claude/tools/menubar-meters && ./uninstall.sh
 ```
 
 3アプリを `/Applications` から削除し、システム設定を導入前の値に戻す。間隔の復元はログアウト→ログインで全アプリに反映。

@@ -11,8 +11,8 @@ macOS のメニューバーを省スペースにする自作アプリ3点セッ�
 必要なもの: macOS 13 以降、Xcode Command Line Tools（`xcode-select --install`）
 
 ```bash
-git clone https://github.com/withfox-fox1/menubar-meters.git ~/menubar-meters
-cd ~/menubar-meters
+git clone https://github.com/withfox-fox1/menubar-meters.git ~/claude/tools/menubar-meters
+cd ~/claude/tools/menubar-meters
 ./install.sh              # アプリ導入＋メニューバー設定（標準アイコン非表示・時計アナログ化・間隔詰め）
 ./install.sh --apps-only  # アプリだけ入れる
 ```
