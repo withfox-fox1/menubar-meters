@@ -17,6 +17,8 @@ struct BatteryInfo {
     /// minutes が macOS の推定値ではなく電流値からの自前計算かどうか
     var isEstimated = false
     var adapterWatts: Int?
+    /// 低電力モードが現在有効か（「バッテリー使用時のみ」設定で電源接続中なら false）
+    var lowPowerMode = false
 
     static func current(estimator: CurrentEstimator) -> BatteryInfo? {
         guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
@@ -61,7 +63,8 @@ struct BatteryInfo {
                 state = .acNotCharging(minutes: orEstimate(nil, raw?.minutesToEmpty))
             }
             let watts = (IOPSCopyExternalPowerAdapterDetails()?.takeRetainedValue() as? [String: Any])?[kIOPSPowerAdapterWattsKey] as? Int
-            return BatteryInfo(percent: percent, state: state, isEstimated: estimated, adapterWatts: onAC ? watts : nil)
+            return BatteryInfo(percent: percent, state: state, isEstimated: estimated, adapterWatts: onAC ? watts : nil,
+                               lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled)
         }
         return nil
     }
@@ -189,19 +192,26 @@ enum StatusImageRenderer {
     static let height: CGFloat = 22
 
     static func render(_ info: BatteryInfo) -> NSImage {
+        // 低電力モード中は電池アイコンだけ色付きにするため、テンプレート画像にできない。
+        // その場合の文字色は描画時のアピアランス（メニューバーのライト/ダーク）から解決する
+        let colored = info.lowPowerMode
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .right
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
-            .foregroundColor: NSColor.black,
+            .foregroundColor: colored ? NSColor.labelColor : NSColor.black,
             .paragraphStyle: paragraph,
         ]
         let top = NSAttributedString(string: "\(info.percent)%", attributes: attrs)
         let bottom = NSMutableAttributedString(string: info.bottomLine, attributes: attrs)
+        var symbolConfig = NSImage.SymbolConfiguration(pointSize: 8, weight: .semibold)
+        if colored {
+            symbolConfig = symbolConfig.applying(.init(paletteColors: [.labelColor]))
+        }
         if let name = info.bottomSymbol,
            let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-               .withSymbolConfiguration(.init(pointSize: 8, weight: .semibold)) {
+               .withSymbolConfiguration(symbolConfig) {
             let attachment = NSTextAttachment()
             attachment.image = symbol
             attachment.bounds = NSRect(x: 0, y: -1, width: symbol.size.width, height: symbol.size.height)
@@ -228,8 +238,8 @@ enum StatusImageRenderer {
             bottom.draw(in: NSRect(x: x, y: -1, width: textWidth, height: lineHeight + 1.5))
             return true
         }
-        // テンプレート画像にしてライト/ダーク・壁紙色に自動追従させる
-        image.isTemplate = true
+        // 通常時はテンプレート画像にしてライト/ダーク・壁紙色に自動追従させる
+        image.isTemplate = !colored
         return image
     }
 
@@ -246,9 +256,79 @@ enum StatusImageRenderer {
             default: name = "battery.0percent"
             }
         }
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        var config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        if info.lowPowerMode {
+            // macOS 標準の低電力モード表示に合わせて黄色にする
+            config = config.applying(.init(paletteColors: [.systemYellow]))
+        }
         return NSImage(systemSymbolName: name, accessibilityDescription: "バッテリー")?
             .withSymbolConfiguration(config)
+    }
+}
+
+// MARK: - 低電力モードの切替
+
+/// `pmset -a lowpowermode 0|1` で低電力モードを切り替える（root 権限が必要）。
+/// 初回のみ管理者パスワードを求め、この2コマンドだけをパスワードなしで実行できる
+/// sudoers 設定（/etc/sudoers.d/batterymeter-lowpower）を追加する。以降は `sudo -n` で即時に切り替える。
+final class LowPowerModeController {
+    static let sudoersPath = "/etc/sudoers.d/batterymeter-lowpower"
+    private let queue = DispatchQueue(label: "BatteryMeter.LowPowerMode")
+
+    /// completion はメインスレッドで呼ばれる。失敗時はエラーメッセージ、成功・キャンセル時は nil
+    func set(enabled: Bool, completion: @escaping (String?) -> Void) {
+        let value = enabled ? "1" : "0"
+        queue.async {
+            let ok = Self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "lowpowermode", value]) == 0
+            DispatchQueue.main.async {
+                // 許可設定がまだない（または壊れている）場合は、設定の追加と切替を1回の認証で行う。
+                // NSAppleScript はメインスレッドで使う
+                completion(ok ? nil : Self.installSudoersAndSet(value))
+            }
+        }
+    }
+
+    @discardableResult
+    private static func run(_ path: String, _ args: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
+    }
+
+    private static func installSudoersAndSet(_ value: String) -> String? {
+        let user = NSUserName()
+        // ユーザー名は sudoers・シェルに埋め込むため、想定外の文字を含む場合は中止する
+        guard !user.isEmpty, user.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
+            return "ユーザー名に想定外の文字が含まれているため、自動設定できません。"
+        }
+        let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0, /usr/bin/pmset -a lowpowermode 1"
+        let script = [
+            "set -e",
+            "tmp=$(/usr/bin/mktemp)",
+            "trap '/bin/rm -f \"$tmp\"' EXIT",
+            "/usr/bin/printf '%s\\n' '\(rule)' > \"$tmp\"",
+            "/usr/sbin/visudo -cf \"$tmp\" >/dev/null",
+            "/usr/bin/install -m 0440 -o root -g wheel \"$tmp\" \(sudoersPath)",
+            "/usr/bin/pmset -a lowpowermode \(value)",
+        ].joined(separator: "\n")
+        let escaped = script
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"\(escaped)\" with prompt \"BatteryMeter が低電力モードを切り替えるための許可設定を追加します（初回のみ）。\" with administrator privileges"
+        var errorInfo: NSDictionary?
+        _ = NSAppleScript(source: source)?.executeAndReturnError(&errorInfo)
+        guard let errorInfo else { return nil }
+        if errorInfo[NSAppleScript.errorNumber] as? Int == -128 { return nil } // ユーザーがキャンセル
+        return errorInfo[NSAppleScript.errorMessage] as? String ?? "不明なエラー"
     }
 }
 
@@ -261,6 +341,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let estimator = CurrentEstimator()
     private var lastInfo: BatteryInfo?
+    private var appearanceObservation: NSKeyValueObservation?
+    private let lowPower = LowPowerModeController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -282,6 +364,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             runLoopSource = source
         }
 
+        // 低電力モードの切替（このアプリ・コントロールセンター・システム設定のいずれから）を即時反映
+        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.update()
+        }
+        // 低電力モード中は非テンプレート画像のため、メニューバーのライト/ダーク切替時に描き直す
+        appearanceObservation = statusItem.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.update() }
+        }
+
         // 残り時間の推定値は通知なしで変わるため定期更新も行う
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.update()
@@ -294,7 +385,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let info = lastInfo {
             button.image = StatusImageRenderer.render(info)
             button.title = ""
-            button.toolTip = ([info.percent].map { "残量：\($0)%" } + info.detailLines).joined(separator: "\n")
+            let lowPowerLine = info.lowPowerMode ? ["低電力モード：オン"] : []
+            button.toolTip = (["残量：\(info.percent)%"] + info.detailLines + lowPowerLine).joined(separator: "\n")
         } else {
             button.image = nil
             button.title = "電池なし"
@@ -312,6 +404,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabledItem("内蔵バッテリーが見つかりません"))
         }
         menu.addItem(.separator())
+
+        let lowPowerItem = NSMenuItem(title: "低電力モード", action: #selector(toggleLowPowerMode), keyEquivalent: "")
+        lowPowerItem.target = self
+        lowPowerItem.state = ProcessInfo.processInfo.isLowPowerModeEnabled ? .on : .off
+        menu.addItem(lowPowerItem)
 
         let settings = NSMenuItem(title: "バッテリー設定を開く…", action: #selector(openBatterySettings), keyEquivalent: "")
         settings.target = self
@@ -335,6 +432,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openBatterySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func toggleLowPowerMode() {
+        let enable = !ProcessInfo.processInfo.isLowPowerModeEnabled
+        lowPower.set(enabled: enable) { [weak self] error in
+            if let error {
+                NSLog("BatteryMeter: low power mode toggle failed: \(error)")
+                let alert = NSAlert()
+                alert.messageText = "低電力モードを切り替えられませんでした"
+                alert.informativeText = error
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+            self?.update()
         }
     }
 

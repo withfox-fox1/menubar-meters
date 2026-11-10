@@ -16,10 +16,10 @@ struct DeviceInfo {
     let right: Int?
     let caseLevel: Int?
 
-    init(_ device: IOBluetoothDevice, levels: BatteryLevels?) {
+    init(_ device: IOBluetoothDevice, isConnected: Bool, levels: BatteryLevels?) {
         self.device = device
         name = device.name ?? device.addressString ?? "不明なデバイス"
-        isConnected = device.isConnected()
+        self.isConnected = isConnected
         let levels = isConnected ? levels : nil
         single = levels?.single
         left = levels?.left
@@ -75,14 +75,20 @@ struct DeviceInfo {
         }
     }
 
-    static func all(levels: [String: BatteryLevels]) -> [DeviceInfo] {
-        ((IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []).map {
-            DeviceInfo($0, levels: $0.addressString.flatMap { levels[$0] })
+    /// 接続状態は子プロセスで読んだ snapshot を優先する（同一プロセス内の isConnected() は
+    /// 長時間起動後に古い値のまま残ることがあるため）。snapshot が無い場合のみ isConnected() を使う。
+    static func all(snapshot: BluetoothSnapshot?) -> [DeviceInfo] {
+        ((IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []).map { device in
+            let address = device.addressString
+            let connected = snapshot.map { s in address.map { s.connected.contains($0) } ?? false }
+                ?? device.isConnected()
+            return DeviceInfo(device, isConnected: connected,
+                              levels: address.flatMap { snapshot?.levels[$0] })
         }
     }
 }
 
-// MARK: - 残量の取得
+// MARK: - 接続状態・残量の取得
 
 /// 1 台分の残量（%）。未取得の値は nil
 struct BatteryLevels: Codable {
@@ -92,16 +98,26 @@ struct BatteryLevels: Codable {
     var caseLevel: Int?
 }
 
+/// 子プロセスで読んだ Bluetooth の状態
+struct BluetoothSnapshot: Codable {
+    /// 接続中デバイスのアドレス
+    var connected: [String]
+    /// 残量の取れたデバイスの {アドレス: 残量}
+    var levels: [String: BatteryLevels]
+}
+
 /// 残量は IOBluetoothDevice の非公開プロパティから取得する。
 /// 同一プロセス内ではプロセス起動時に読み込んだ値が更新されず、切断→再接続後は 0 のままになる
 /// （2026-10-12 実測）。そのため取得のたびに自分自身を `--dump-battery` 付きで別プロセス起動し、
 /// 最新値を JSON で受け取る。将来の macOS で取得できなくなった場合は残量を表示しないだけで動作は継続する。
+/// 接続状態（isConnected）も同様に長時間起動後に実態とずれることがあるため（2026-11-02 報告：
+/// 未接続のデバイスにメニューのチェックが付く）、子プロセスで残量と一緒に読む。
 enum BatteryReader {
     static let dumpArgument = "--dump-battery"
 
-    /// 子プロセス側：接続中デバイスの残量を {アドレス: BatteryLevels} の JSON で標準出力へ書く
+    /// 子プロセス側：接続中デバイスと残量を BluetoothSnapshot の JSON で標準出力へ書く
     static func dump() {
-        var result: [String: BatteryLevels] = [:]
+        var result = BluetoothSnapshot(connected: [], levels: [:])
         for device in (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? [] where device.isConnected() {
             // 0 は「未取得」を意味する
             func level(_ key: String) -> Int? {
@@ -110,10 +126,11 @@ enum BatteryReader {
                 return v
             }
             guard let address = device.addressString else { continue }
+            result.connected.append(address)
             let levels = BatteryLevels(single: level("batteryPercentSingle"), left: level("batteryPercentLeft"),
                                        right: level("batteryPercentRight"), caseLevel: level("batteryPercentCase"))
             if levels.single != nil || levels.left != nil || levels.right != nil {
-                result[address] = levels
+                result.levels[address] = levels
             }
         }
         if let data = try? JSONEncoder().encode(result) {
@@ -121,32 +138,36 @@ enum BatteryReader {
         }
     }
 
-    /// 親プロセス側：子プロセスを起動して残量を読む（バックグラウンドで実行し、完了時にメインスレッドで通知）
-    static func read(completion: @escaping ([String: BatteryLevels]) -> Void) {
+    /// 親プロセス側：子プロセスを起動して状態を読む。失敗時は nil
+    static func readSync(timeout: TimeInterval) -> BluetoothSnapshot? {
+        guard let path = Bundle.main.executablePath else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = [dumpArgument]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            NSLog("BluetoothMeter: battery reader failed: \(error)")
+            return nil
+        }
+        // 万一応答しない場合に備えて打ち切る
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+            if process.isRunning { process.terminate() }
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return try? JSONDecoder().decode(BluetoothSnapshot.self, from: data)
+    }
+
+    /// バックグラウンドで readSync を実行し、完了時にメインスレッドで通知する
+    static func read(completion: @escaping (BluetoothSnapshot?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            var levels: [String: BatteryLevels] = [:]
-            if let path = Bundle.main.executablePath {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = [dumpArgument]
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = FileHandle.nullDevice
-                do {
-                    try process.run()
-                    // 万一応答しない場合に備えて 5 秒で打ち切る
-                    let deadline = DispatchTime.now() + 5
-                    DispatchQueue.global().asyncAfter(deadline: deadline) {
-                        if process.isRunning { process.terminate() }
-                    }
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    levels = (try? JSONDecoder().decode([String: BatteryLevels].self, from: data)) ?? [:]
-                } catch {
-                    NSLog("BluetoothMeter: battery reader failed: \(error)")
-                }
-            }
-            DispatchQueue.main.async { completion(levels) }
+            let snapshot = readSync(timeout: 5)
+            DispatchQueue.main.async { completion(snapshot) }
         }
     }
 }
@@ -228,7 +249,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var connectNotification: IOBluetoothUserNotification?
     private var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
-    private var levels: [String: BatteryLevels] = [:]
+    /// 子プロセスで読んだ最新の状態。読めなかった場合は nil（同一プロセスの値で代用する）
+    private var snapshot: BluetoothSnapshot?
     private var isMenuOpen = false
     private var lastRepair = Date.distantPast
 
@@ -254,7 +276,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disconnectNotifications[address] = device.register(
                 forDisconnectNotification: self, selector: #selector(deviceDisconnected(_:device:)))
         }
-        update()
+        // 接続状態は子プロセスで読むため、表示の更新も読み直し完了時に行う
+        refreshBattery()
         // 残量は接続直後には未取得のことが多いため、間隔を空けて数回取得する
         for delay in [2.0, 8.0, 20.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.refreshBattery() }
@@ -264,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func deviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
         notification.unregister()
         if let address = device.addressString { disconnectNotifications[address] = nil }
-        update()
+        refreshBattery()
     }
 
     /// メニューバーに出すデバイス：残量の取れる接続中デバイスのうち、オーディオ機器を優先
@@ -274,15 +297,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshBattery() {
-        BatteryReader.read { [weak self] levels in
-            self?.levels = levels
+        BatteryReader.read { [weak self] snapshot in
+            self?.snapshot = snapshot
             self?.update()
         }
     }
 
     private func update() {
         guard let button = statusItem.button else { return }
-        let devices = DeviceInfo.all(levels: levels)
+        let devices = DeviceInfo.all(snapshot: snapshot)
         let image = primaryDevice(devices).map(StatusImageRenderer.render) ?? StatusImageRenderer.renderIdle()
         button.image = image
         // variableLength のままだと、幅の広い画像から狭い画像へ差し替えても項目幅が縮まないことがある
@@ -333,7 +356,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let devices = DeviceInfo.all(levels: levels)
+        // メニューを開いた時点の実態を反映するため、その場で読み直す（通常 0.05 秒程度）
+        snapshot = BatteryReader.readSync(timeout: 1)
+        let devices = DeviceInfo.all(snapshot: snapshot)
 
         if IOBluetoothHostController.default()?.powerState != kBluetoothHCIPowerStateON {
             menu.addItem(disabledItem("Bluetooth はオフです"))
@@ -388,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let device = sender.representedObject as? IOBluetoothDevice else { return }
         if device.isConnected() {
             device.closeConnection()
-            update()
+            refreshBattery()
         } else {
             // target を渡すと非同期接続になり、完了時に connectionComplete が呼ばれる
             let result = device.openConnection(self)
@@ -402,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if status != kIOReturnSuccess {
             NSLog("BluetoothMeter: connection to \(device.name ?? "?") failed: \(status)")
         }
-        update()
+        refreshBattery()
     }
 
     @objc private func openSettings() {
